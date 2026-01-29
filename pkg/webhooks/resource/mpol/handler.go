@@ -59,7 +59,8 @@ func New(
 
 func (h *handler) MutateClustered(ctx context.Context, logger logr.Logger, admissionRequest handlers.AdmissionRequest, _ string, _ time.Time) handlers.AdmissionResponse {
 	policies := policyNamesFromContext(ctx)
-	return h.mutate(ctx, logger, admissionRequest, policies, mpolengine.And(mpolengine.MatchNames(policies...), mpolengine.ClusteredPolicy()))
+	isBackgroundRequest := h.backgroundServiceAccountName == admissionRequest.UserInfo.Username
+	return h.mutate(ctx, logger, admissionRequest, policies, isBackgroundRequest, mpolengine.And(mpolengine.MatchNames(policies...), mpolengine.ClusteredPolicy()))
 }
 
 func (h *handler) MutateNamespaced(ctx context.Context, logger logr.Logger, admissionRequest handlers.AdmissionRequest, _ string, _ time.Time) handlers.AdmissionResponse {
@@ -67,19 +68,20 @@ func (h *handler) MutateNamespaced(ctx context.Context, logger logr.Logger, admi
 		return admissionutils.ResponseSuccess(admissionRequest.UID)
 	}
 	policies := policyNamesFromContext(ctx)
-	return h.mutate(ctx, logger, admissionRequest, policies, mpolengine.And(mpolengine.MatchNames(policies...), mpolengine.NamespacedPolicy(admissionRequest.Namespace)))
+	isBackgroundRequest := h.backgroundServiceAccountName == admissionRequest.UserInfo.Username
+	return h.mutate(ctx, logger, admissionRequest, policies, isBackgroundRequest, mpolengine.And(mpolengine.MatchNames(policies...), mpolengine.NamespacedPolicy(admissionRequest.Namespace)))
 }
 
-func (h *handler) mutate(ctx context.Context, logger logr.Logger, admissionRequest handlers.AdmissionRequest, policies []string, predicate mpolengine.Predicate) handlers.AdmissionResponse {
-	if h.backgroundServiceAccountName == admissionRequest.UserInfo.Username {
-		return admissionutils.ResponseSuccess(admissionRequest.UID)
-	}
+func (h *handler) mutate(ctx context.Context, logger logr.Logger, admissionRequest handlers.AdmissionRequest, policies []string, isBackgroundRequest bool, predicate mpolengine.Predicate) handlers.AdmissionResponse {
 	if len(policies) == 0 {
 		return admissionutils.ResponseSuccess(admissionRequest.UID)
 	}
 
+	// Combine the predicate with skipBackgroundRequests filter
+	combinedPredicate := mpolengine.And(predicate, mpolengine.SkipBackgroundRequests(isBackgroundRequest))
+
 	request := celengine.RequestFromAdmission(h.context, admissionRequest.AdmissionRequest)
-	response, err := h.engine.Handle(ctx, request, predicate)
+	response, err := h.engine.Handle(ctx, request, combinedPredicate)
 	if err != nil {
 		logger.Error(err, "failed to handle mutating policy request")
 		return admissionutils.ResponseSuccess(admissionRequest.UID)
@@ -94,6 +96,19 @@ func (h *handler) mutate(ctx context.Context, logger logr.Logger, admissionReque
 	go func() {
 		mpols := h.engine.MatchedMutateExistingPolicies(ctx, request)
 		for _, p := range mpols {
+			// Check skipBackgroundRequests setting for each policy
+			if isBackgroundRequest {
+				compiledPolicy, err := h.engine.GetCompiledPolicy(p)
+				if err != nil {
+					logger.Error(err, "failed to get compiled policy", "policy", p)
+					continue
+				}
+				if compiledPolicy.Policy.GetSpec().SkipBackgroundRequestsEnabled() {
+					logger.V(4).Info("skipping mutate existing policy for background request",
+						"policy", p, "skipBackgroundRequests", true)
+					continue
+				}
+			}
 			logger.V(4).Info("creating a UR for mpol", "name", p)
 			if err := h.urGenerator.Apply(ctx, kyvernov2.UpdateRequestSpec{
 				Type:   kyvernov2.CELMutate,

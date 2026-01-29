@@ -46,3 +46,15 @@ func Or(conditions ...Predicate) Predicate {
 		return false
 	}
 }
+
+// SkipBackgroundRequests returns a predicate that filters out policies that have
+// skipBackgroundRequests enabled when the request is a background request.
+// When isBackgroundRequest is false, this predicate always returns true (no filtering).
+func SkipBackgroundRequests(isBackgroundRequest bool) Predicate {
+	if !isBackgroundRequest {
+		return func(policiesv1beta1.MutatingPolicyLike) bool { return true }
+	}
+	return func(policy policiesv1beta1.MutatingPolicyLike) bool {
+		return !policy.GetSpec().SkipBackgroundRequestsEnabled()
+	}
+}
